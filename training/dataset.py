@@ -15,22 +15,28 @@ import PIL.Image
 import json
 import torch
 import dnnlib
+import nibabel as nib
+import pandas as pd
+from skimage.transform import resize
+import torchio as tio
 
 try:
     import pyspng
 except ImportError:
     pyspng = None
 
-#----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+
 
 class Dataset(torch.utils.data.Dataset):
-    def __init__(self,
-        name,                   # Name of the dataset.
-        raw_shape,              # Shape of the raw image data (NCHW).
-        max_size    = None,     # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
-        use_labels  = False,    # Enable conditioning labels? False = label dimension is zero.
-        xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
-        random_seed = 0,        # Random seed to use when applying max_size.
+    def __init__(
+        self,
+        name,  # Name of the dataset.
+        raw_shape,  # Shape of the raw image data (NCHW).
+        max_size=None,  # Artificially limit the size of the dataset. None = no limit. Applied before xflip.
+        use_labels=False,  # Enable conditioning labels? False = label dimension is zero.
+        xflip=False,  # Artificially double the size of the dataset via x-flips. Applied after max_size.
+        random_seed=0,  # Random seed to use when applying max_size.
     ):
         self._name = name
         self._raw_shape = list(raw_shape)
@@ -63,13 +69,13 @@ class Dataset(torch.utils.data.Dataset):
                 assert np.all(self._raw_labels >= 0)
         return self._raw_labels
 
-    def close(self): # to be overridden by subclass
+    def close(self):  # to be overridden by subclass
         pass
 
-    def _load_raw_image(self, raw_idx): # to be overridden by subclass
+    def _load_raw_image(self, raw_idx):  # to be overridden by subclass
         raise NotImplementedError
 
-    def _load_raw_labels(self): # to be overridden by subclass
+    def _load_raw_labels(self):  # to be overridden by subclass
         raise NotImplementedError
 
     def __getstate__(self):
@@ -90,7 +96,7 @@ class Dataset(torch.utils.data.Dataset):
         assert list(image.shape) == self.image_shape
         assert image.dtype == np.uint8
         if self._xflip[idx]:
-            assert image.ndim == 3 # CHW
+            assert image.ndim == 3  # CHW
             image = image[:, :, ::-1]
         return image.copy(), self.get_label(idx)
 
@@ -105,7 +111,7 @@ class Dataset(torch.utils.data.Dataset):
     def get_details(self, idx):
         d = dnnlib.EasyDict()
         d.raw_idx = int(self._raw_idx[idx])
-        d.xflip = (int(self._xflip[idx]) != 0)
+        d.xflip = int(self._xflip[idx]) != 0
         d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
         return d
 
@@ -119,12 +125,12 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def num_channels(self):
-        assert len(self.image_shape) == 3 # CHW
+        assert len(self.image_shape) == 3  # CHW
         return self.image_shape[0]
 
     @property
     def resolution(self):
-        assert len(self.image_shape) == 3 # CHW
+        assert len(self.image_shape) == 3  # CHW
         assert self.image_shape[1] == self.image_shape[2]
         return self.image_shape[1]
 
@@ -151,52 +157,72 @@ class Dataset(torch.utils.data.Dataset):
     def has_onehot_labels(self):
         return self._get_raw_labels().dtype == np.int64
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
 
 class ImageFolderDataset(Dataset):
-    def __init__(self,
-        path,                   # Path to directory or zip.
-        resolution      = None, # Ensure specific resolution, None = highest available.
-        **super_kwargs,         # Additional arguments for the Dataset base class.
+    def __init__(
+        self,
+        path,  # Path to directory or zip.
+        resolution=None,  # Ensure specific resolution, None = highest available.
+        **super_kwargs,  # Additional arguments for the Dataset base class.
     ):
         self._path = path
         self._zipfile = None
 
         if os.path.isdir(self._path):
-            self._type = 'dir'
-            self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
-        elif self._file_ext(self._path) == '.zip':
-            self._type = 'zip'
+            self._type = "dir"
+            self._all_fnames = {
+                os.path.relpath(os.path.join(root, fname), start=self._path)
+                for root, _dirs, files in os.walk(self._path)
+                for fname in files
+            }
+        elif self._file_ext(self._path) == ".zip":
+            self._type = "zip"
             self._all_fnames = set(self._get_zipfile().namelist())
+        elif self._file_ext(self._path) == ".csv":
+            data = pd.read_csv(self._path)
+            cdr0 = data[data["CDGLOBAL"] == 0.0]
+            sample_size = 998
+            sample_data = cdr0.sample(sample_size, random_state=42)
+            self._all_fnames = sample_data["filepath_MNI"].values
         else:
-            raise IOError('Path must point to a directory or zip')
+            raise IOError("Path must point to a directory or zip")
 
         PIL.Image.init()
-        self._image_fnames = sorted(fname for fname in self._all_fnames if self._file_ext(fname) in PIL.Image.EXTENSION)
+        self._image_fnames = sorted(
+            fname for fname in self._all_fnames if self._filename_is_valid(fname)
+        )
         if len(self._image_fnames) == 0:
-            raise IOError('No image files found in the specified path')
+            raise IOError("No image files found in the specified path")
 
         name = os.path.splitext(os.path.basename(self._path))[0]
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        if resolution is not None and (raw_shape[2] != resolution or raw_shape[3] != resolution):
-            raise IOError('Image files do not match the specified resolution')
+        if resolution is not None and (
+            raw_shape[2] != resolution or raw_shape[3] != resolution
+        ):
+            raise IOError("Image files do not match the specified resolution")
         super().__init__(name=name, raw_shape=raw_shape, **super_kwargs)
 
     @staticmethod
     def _file_ext(fname):
         return os.path.splitext(fname)[1].lower()
 
+    def _filename_is_valid(self, filename: str) -> bool:
+        return self._file_ext(filename) in PIL.Image.EXTENSION
+
     def _get_zipfile(self):
-        assert self._type == 'zip'
+        assert self._type == "zip"
         if self._zipfile is None:
             self._zipfile = zipfile.ZipFile(self._path)
         return self._zipfile
 
     def _open_file(self, fname):
-        if self._type == 'dir':
-            return open(os.path.join(self._path, fname), 'rb')
-        if self._type == 'zip':
-            return self._get_zipfile().open(fname, 'r')
+        if self._type == "dir":
+            return open(os.path.join(self._path, fname), "rb")
+        if self._type == "zip":
+            return self._get_zipfile().open(fname, "r")
         return None
 
     def close(self):
@@ -212,27 +238,90 @@ class ImageFolderDataset(Dataset):
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
         with self._open_file(fname) as f:
-            if pyspng is not None and self._file_ext(fname) == '.png':
+            if pyspng is not None and self._file_ext(fname) == ".png":
                 image = pyspng.load(f.read())
             else:
                 image = np.array(PIL.Image.open(f))
         if image.ndim == 2:
-            image = image[:, :, np.newaxis] # HW => HWC
-        image = image.transpose(2, 0, 1) # HWC => CHW
+            image = image[:, :, np.newaxis]  # HW => HWC
+        image = image.transpose(2, 0, 1)  # HWC => CHW
         return image
 
     def _load_raw_labels(self):
-        fname = 'dataset.json'
+        fname = "dataset.json"
         if fname not in self._all_fnames:
             return None
         with self._open_file(fname) as f:
-            labels = json.load(f)['labels']
+            labels = json.load(f)["labels"]
         if labels is None:
             return None
         labels = dict(labels)
-        labels = [labels[fname.replace('\\', '/')] for fname in self._image_fnames]
+        labels = [labels[fname.replace("\\", "/")] for fname in self._image_fnames]
         labels = np.array(labels)
         labels = labels.astype({1: np.int64, 2: np.float32}[labels.ndim])
         return labels
 
-#----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------------
+
+
+class AdniMRIDataset3D(ImageFolderDataset):
+    def __init__(
+        self,
+        path,
+        resolution: int = None,
+        data_name: str = "adni",
+        augmentation: bool = True,
+        filename_condition: str = "T1toMNInonlin.nii.gz",
+        **super_kwargs,
+    ):
+        self.path = path
+        self.data_name = data_name
+        self.augmentation = augmentation
+        self.filename_condition = filename_condition
+        super().__init__(path, resolution, **super_kwargs)
+
+    def roi_crop(self, image):
+        # Mask of non-black pixels (assuming image has a single channel).
+        mask = image > 0
+
+        # Coordinates of non-black pixels.
+        coords = np.argwhere(mask)
+
+        # Bounding box of non-black pixels.
+        x0, y0, z0 = coords.min(axis=0)
+        x1, y1, z1 = coords.max(axis=0) + 1  # slices are exclusive at the top
+
+        # Get the contents of the bounding box.
+        cropped = image[x0:x1, y0:y1, z0:z1]
+
+        padded_crop = tio.CropOrPad(np.max(cropped.shape))(cropped.copy()[None])
+
+        padded_crop = np.transpose(padded_crop, (1, 2, 3, 0))
+
+        return padded_crop
+
+    # Returned image is of shape (dim, x, y)
+    def _load_raw_image(self, raw_idx):
+        path = self._image_fnames[raw_idx]
+        img = nib.load(path)
+        img = np.swapaxes(img.get_data(), 1, 2)
+        img = np.flip(img, 1)
+        img = np.flip(img, 2)
+        img = self.roi_crop(image=img)
+        sp_size = 64
+        img = resize(img, (sp_size, sp_size, sp_size), mode="constant")
+        if self.augmentation:
+            random_n = torch.rand(1)
+            random_i = 0.3 * torch.rand(1)[0] + 0.7
+            if random_n[0] > 0.5:
+                img = np.flip(img, 0)
+            img = img * random_i.data.cpu().numpy()
+        imageout = torch.from_numpy(img).float().view(sp_size, sp_size, sp_size)
+        imageout = imageout * 2 - 1
+        imageout = imageout.numpy()
+        imageout = np.uint8(imageout)
+        return imageout
+
+    def _filename_is_valid(self, filename: str) -> bool:
+        return filename.endswith(self.filename_condition)
